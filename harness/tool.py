@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 """
-Step 2 & Step 3 核心组件：Tool 抽象、自动 Schema 生成与四大编码工具 (harness/tool.py)
+Step 2 & Step 3 核心组件：Tool 抽象、结构化执行结果与四大编码工具 (harness/tool.py)
 
 第一性原理视角：
-Tool 抽象层的本质是一座“双向桥”：
-  - 向左（朝向 LLM）：用 `inspect.signature` 把 Python 函数反射成 OpenAI JSON Schema（自动隐藏 `runtime` 参数）；
-  - 向右（朝向系统）：把 LLM 返回的 `tool_call(name, arguments_json)` 自动反序列化，并注入宿主 `runtime: AgentRuntime` 实例。
+1. **对 LLM 暴露 JSON Schema，对 Harness 隐藏 `runtime` 注入参数**；
+2. **结构化执行结果（`ToolExecutionResult`）**：
+   Harness 内部绝不靠 `"PERMISSION_DENIED" in result_str` 这种脆弱的字符串匹配来判断工具状态，
+   而是通过 `ToolExecutionResult(status="ok" | "error" | "denied", content=...)` 精确传递意图；
+   只有最后一步塞进 `messages` 给 LLM 看时，才取 `.content` 字符串。
 """
 
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 import subprocess
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from harness.runtime import AgentRuntime
@@ -30,10 +32,30 @@ TYPE_MAP: dict[Any, str] = {
     "bool": "boolean",
 }
 
+ToolStatus = Literal["ok", "error", "denied"]
+
+
+@dataclass
+class ToolExecutionResult:
+    """
+    工具执行的结构化返回对象：
+    - `status`: 供 Harness 内部精确判断是正常完成 ("ok")、执行/校验出错 ("error") 还是被权限门禁拦截 ("denied")；
+    - `content`: 最终序列化后放入 `role="tool"` 消息中喂给 LLM 的观测文本。
+    """
+
+    status: ToolStatus
+    content: str
+    tool_name: str = ""
+
+    @property
+    def is_error(self) -> bool:
+        return self.status in {"error", "denied"}
+
 
 @dataclass
 class Tool:
     """统一的工具描述符。"""
+
     name: str
     description: str
     parameters: dict[str, Any]
@@ -121,6 +143,71 @@ class ToolRegistry:
     def openai_schemas(self) -> list[dict[str, Any]]:
         return [t.to_openai_schema() for t in self._tools.values()]
 
+    def execute_structured(
+        self,
+        name: str,
+        raw_arguments: str,
+        runtime: AgentRuntime | None = None,
+        **context: Any,
+    ) -> ToolExecutionResult:
+        """
+        结构化执行入口（供 Harness Loop 使用）：
+        返回 `ToolExecutionResult(status="ok" | "error" | "denied", content=...)`，
+        让 Harness 无需靠字符串匹配即可精确识别执行结果状态。
+        """
+        t = self.get(name)
+        if t is None:
+            return ToolExecutionResult(
+                status="error",
+                content=f"[ERROR] Unknown tool: '{name}'",
+                tool_name=name,
+            )
+
+        try:
+            args = json.loads(raw_arguments or "{}")
+            if not isinstance(args, dict):
+                return ToolExecutionResult(
+                    status="error",
+                    content=f"[ERROR] Tool arguments must be a JSON object, got: {type(args).__name__}",
+                    tool_name=name,
+                )
+        except json.JSONDecodeError as e:
+            return ToolExecutionResult(
+                status="error",
+                content=f"[ERROR] Invalid JSON arguments for tool '{name}': {e}",
+                tool_name=name,
+            )
+
+        # Step 3: 如果提供了 AgentRuntime，执行 Permission Gate 拦截检查
+        if runtime is not None:
+            allowed, deny_reason = runtime.check_permission(t, args)
+            if not allowed:
+                return ToolExecutionResult(
+                    status="denied",
+                    content=f"[PERMISSION_DENIED] {deny_reason}",
+                    tool_name=name,
+                )
+
+        call_kwargs = dict(args)
+        if t.accepts_runtime:
+            call_kwargs["runtime"] = runtime
+
+        try:
+            raw_out = str(t.func(**call_kwargs))
+        except Exception as e:
+            return ToolExecutionResult(
+                status="error",
+                content=f"[ERROR] Tool '{name}' execution failed: {type(e).__name__}: {e}",
+                tool_name=name,
+            )
+
+        is_err = raw_out.startswith("[ERROR]") or "[exit_code=" in raw_out and not raw_out.startswith("[exit_code=0]")
+        return ToolExecutionResult(
+            status="error" if is_err else "ok",
+            content=raw_out,
+            tool_name=name,
+        )
+
     def execute(
         self,
         name: str,
@@ -128,38 +215,8 @@ class ToolRegistry:
         runtime: AgentRuntime | None = None,
         **context: Any,
     ) -> str:
-        """
-        根据工具名和原始 JSON 字符串执行工具：
-        1. 解析 JSON 参数；
-        2. 若传入了 `runtime: AgentRuntime`，先执行 `runtime.check_permission(tool, args)` 权限门禁；
-        3. 若工具函数声明了 `runtime` 参数，将 `runtime` 实例注入调用。
-        """
-        t = self.get(name)
-        if t is None:
-            return f"[ERROR] Unknown tool: '{name}'"
-
-        try:
-            args = json.loads(raw_arguments or "{}")
-            if not isinstance(args, dict):
-                return f"[ERROR] Tool arguments must be a JSON object, got: {type(args).__name__}"
-        except json.JSONDecodeError as e:
-            return f"[ERROR] Invalid JSON arguments for tool '{name}': {e}"
-
-        # Step 3: 如果提供了 AgentRuntime，执行 Permission Gate 拦截检查
-        if runtime is not None:
-            allowed, deny_reason = runtime.check_permission(t, args)
-            if not allowed:
-                return f"[PERMISSION_DENIED] {deny_reason}"
-
-        call_kwargs = dict(args)
-        if t.accepts_runtime:
-            call_kwargs["runtime"] = runtime
-
-        try:
-            result = t.func(**call_kwargs)
-            return str(result)
-        except Exception as e:
-            return f"[ERROR] Tool '{name}' execution failed: {type(e).__name__}: {e}"
+        """便捷字符串入口（兼容直接取文本结果的调用方）。"""
+        return self.execute_structured(name, raw_arguments, runtime=runtime, **context).content
 
 
 # ============================================================================
@@ -173,7 +230,7 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
     - read_file:  眼睛（查看代码，dangerous=False）
     - write_file: 双手（创建/覆写文件，dangerous=True）
     - edit_file:  手术刀（局部精确替换代码，dangerous=True）
-    - bash:       执行器（受控子进程跑命令，dangerous=True）
+    - bash:       执行器（受控沙盒子进程跑命令，dangerous=True）
     """
     default_root = (base_dir or (Path.cwd() / "workspace")).resolve()
     default_root.mkdir(parents=True, exist_ok=True)
@@ -242,7 +299,7 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
 
     @tool(
         name="bash",
-        description="Execute a shell command in the workspace directory and return stdout/stderr.",
+        description="Execute a shell command in the isolated workspace runtime and return stdout/stderr.",
         dangerous=True,
     )
     def bash(command: str, runtime: AgentRuntime | None = None) -> str:

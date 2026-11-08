@@ -2,26 +2,32 @@
 from __future__ import annotations
 
 """
-Step 3: AgentRuntime 容器与 Permission Gate 安全护栏
-====================================================
+Step 3: AgentRuntime（环境隔离沙盒 + 细粒度命令前缀权限引擎 + 结构化状态）
+==========================================================================
 
-相比 Step 2 的进化（NEW IN STEP 3）：
-1. **引入 `AgentRuntime`（即 Environment 容器）**：
-   - 统一维护 `workspace_root`、`cwd`、会话 `messages` 以及本轮被修改的文件集合 `modified_files`；
-   - 提供受控子进程执行器 `runtime.run_command()`：强制超时保护（防死循环命令卡死）+ 超长输出截断（防撑爆上下文）。
-2. **引入 `PermissionGate`（高危操作安全护栏）**：
-   - 工具分为安全工具（`read_file`, `dangerous=False`）和高危工具（`write_file`, `edit_file`, `bash`, `dangerous=True`）；
-   - 执行高危工具前，`ToolRegistry.execute(..., runtime=runtime)` 会自动触发 `runtime.check_permission()`；
-   - 如果被人类拒绝，不会抛异常崩掉，而是返回 `[PERMISSION_DENIED] ...` 消息给 LLM，让 LLM 调整方案！
+相比 Step 2 的三大核心进化（NEW IN STEP 3）：
+1. **沙盒隔离（Sandbox Isolation）**：
+   - **环境变量净室隔离**：`runtime.build_isolated_env()` 自动剥离宿主机的 `OPENAI_API_KEY` 等敏感机密，子进程跑 `env` 也绝不会泄露你的 API Key；
+   - **文件系统边界隔离（Filesystem Jail）**：`runtime.resolve_path()` 强制校验路径不得跳出 `workspace_root`；
+   - **受控子进程**：强制超时保护（`timeout`）与超长输出截断（`max_output_chars`），并支持生成 macOS `sandbox-exec` 内核级沙盒策略。
+2. **工业级命令拆解与前缀权限引擎（Command Prefix Permission Gate）**：
+   - 先用 `split_shell_commands()` 按 `&&`, `||`, `;`, `|` 拆解复合命令，用 `has_dangerous_shell_syntax()` 拦截 `$()` 与重定向；
+   - 提取 `(二进制 + 子命令)` 前缀（如 `ls`, `git status`, `python3 -m unittest`）：
+     * 只读白名单命令（如 `ls -la && git status`）无需弹窗，自动静默放行；
+     * 若混入高危子命令（如 `ls -la && rm -f fib.py`），整条拦截！
+     * 当用户输入 `a` 记住权限时，仅将当前安全的命令前缀（如 `python3`）加入 `allowed_command_prefixes`，绝不放行 `rm`。
+3. **结构化执行结果（`ToolExecutionResult`）**：
+   - 主循环通过 `result.status`（`"ok" | "error" | "denied"`）精确识别工具状态，彻底告别靠字符串包含判断意图。
 
 运行方式：
-  1. 免 Key 离线演示（模拟：第 1 次危险命令被拒绝 -> LLM 改用安全方案并获批 -> 演示超时拦截）：
+  1. 免 Key 离线演示（完整演示：只读命令免批放行 -> 复合命令混入 rm 被拦截 -> 环境变量隔离防 Key 泄露）：
      python3 steps/step03_runtime.py --demo
-  2. 使用真实 OpenAI API（每次写文件或执行命令前会在终端弹出 [y/n/a] 让你亲自审批！）：
-     python3 steps/step03_runtime.py "查看当前目录有哪些文件，然后新建一个 hello_runtime.py 打印 Hello Runtime 并运行它"
+  2. 使用真实 OpenAI API 交互体验：
+     python3 steps/step03_runtime.py "先用 ls 看看有哪些文件，然后写一个 hello_runtime.py 并运行它"
 """
 
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -35,6 +41,12 @@ from harness.runtime import AgentRuntime
 from harness.tool import ToolRegistry, create_coding_tools
 from harness.ui import log_step
 
+STATUS_COLOR = {
+    "ok": "magenta",
+    "error": "red",
+    "denied": "red",
+}
+
 
 def run_runtime_agent_loop(
     user_prompt: str,
@@ -45,16 +57,18 @@ def run_runtime_agent_loop(
 ) -> str:
     """
     Step 3 的 Agent Loop：
-    现在消息历史 `runtime.messages`、工作目录 `runtime.cwd` 和权限控制全部收归 `runtime` 统一管理。
+    1. 使用 `registry.execute_structured(..., runtime=runtime)` 拿到结构化的 `ToolExecutionResult`；
+    2. 根据 `result.status`（"ok" / "error" / "denied"）精确处理状态，再把 `result.content` 塞进 `runtime.messages`。
     """
     if not runtime.messages:
         runtime.messages.append(
             {
                 "role": "system",
                 "content": (
-                    f"You are a coding agent running inside workspace: {runtime.workspace_root}. "
-                    "Dangerous tools (write_file, edit_file, bash) require user permission. "
-                    "If a tool call is denied by the user, respect their decision and adapt."
+                    f"You are a coding agent running inside an isolated workspace: {runtime.workspace_root}. "
+                    "Read-only commands (like ls, pwd, git status) are auto-approved. "
+                    "Write operations and unapproved commands require user permission. "
+                    "If a tool call is denied, respect the user's decision and adapt."
                 ),
             }
         )
@@ -63,7 +77,11 @@ def run_runtime_agent_loop(
     schemas = registry.openai_schemas()
 
     log_step("USER", user_prompt, color="blue")
-    log_step("RUNTIME", f"workspace_root={runtime.workspace_root}", color="gray")
+    log_step(
+        "RUNTIME",
+        f"workspace_root={runtime.workspace_root} | path_jail={runtime.enforce_path_sandbox} | env_isolated=True",
+        color="gray",
+    )
 
     for turn in range(1, max_turns + 1):
         log_step("LOOP", f"--- Turn {turn} ---", color="gray")
@@ -76,23 +94,28 @@ def run_runtime_agent_loop(
         if not response.tool_calls:
             log_step(
                 "DONE",
-                f"Task complete! Modified files in this session: {[p.name for p in runtime.modified_files]}",
+                f"Task complete! Modified files: {[p.name for p in runtime.modified_files]} | "
+                f"Allowed prefixes: {sorted(runtime.allowed_command_prefixes)}",
                 color="green",
             )
             return response.content or ""
 
         for call in response.tool_calls:
             log_step("TOOL CALL", f"{call.name}({call.arguments})", color="yellow")
-            # NEW IN STEP 3: 将 runtime 注入 execute()，触发 Permission Gate 与受控子进程执行
-            result_str = registry.execute(call.name, call.arguments, runtime=runtime)
-            color = "red" if ("PERMISSION_DENIED" in result_str or "[ERROR]" in result_str) else "magenta"
-            log_step("TOOL RESULT", f"\n{result_str}", color=color)
+
+            # NEW IN STEP 3: 返回结构化的 ToolExecutionResult(status, content)
+            result = registry.execute_structured(call.name, call.arguments, runtime=runtime)
+            log_step(
+                f"TOOL RESULT [{result.status.upper()}]",
+                f"\n{result.content}",
+                color=STATUS_COLOR.get(result.status, "magenta"),
+            )
 
             runtime.messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": result_str,
+                    "content": result.content,
                 }
             )
 
@@ -101,10 +124,14 @@ def run_runtime_agent_loop(
 
 class ScriptedRuntimeDemoLLM:
     """
-    演示三个核心 Runtime 特性：
-    - Turn 1: 调用 `read_file`（只读工具 dangerous=False，无需审批直接通过）+ 尝试 `bash("rm -rf *.py")`（被 Permission Gate 拦截拒绝！）
-    - Turn 2: LLM 收到 `[PERMISSION_DENIED]` 后放弃删除，改用 `write_file` 创建 `hello_runtime.py`（获批通过）
-    - Turn 3: 调用 `bash("python3 hello_runtime.py")`（获批通过并拿到输出）
+    演示四大硬核特性：
+    - Turn 1:
+      1) `bash("ls -la && pwd")` —— 纯只读白名单复合命令，无需询问用户，自动放行！
+      2) `bash("ls -la && rm -f fib.py")` —— 试图在 `ls` 后面夹带 `rm`，被命令拆解引擎识破并拦截拒绝 (`status="denied"`)！
+    - Turn 2:
+      LLM 收到拒绝后放弃删除，改用 `write_file` 创建 `env_check.py`（检查子进程能否偷到宿主机的 OPENAI_API_KEY）。
+    - Turn 3:
+      调用 `bash("python3 env_check.py")` 验证净室环境变量隔离生效！
     """
 
     def __init__(self) -> None:
@@ -113,57 +140,58 @@ class ScriptedRuntimeDemoLLM:
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> LLMResponse:
         self.turn += 1
         if self.turn == 1:
-            tc_read = ToolCall(id="call_1_read", name="read_file", arguments='{"path": "fib.py"}')
-            tc_rm = ToolCall(id="call_1_rm", name="bash", arguments='{"command": "rm -f fib.py"}')
+            tc_safe = ToolCall(id="call_1_safe", name="bash", arguments='{"command": "ls -la && pwd"}')
+            tc_sneaky = ToolCall(id="call_1_sneaky", name="bash", arguments='{"command": "ls -la && rm -f fib.py"}')
             return LLMResponse(
-                content="我先读取 fib.py（安全操作），然后顺便尝试清理掉旧的 fib.py（高危操作）。",
-                tool_calls=[tc_read, tc_rm],
+                content="我先跑一条只读复合命令 `ls -la && pwd`，再试一条夹带 `rm` 的复合命令 `ls -la && rm -f fib.py`。",
+                tool_calls=[tc_safe, tc_sneaky],
                 raw_message={
                     "role": "assistant",
-                    "content": "我先读取 fib.py（安全操作），然后顺便尝试清理掉旧的 fib.py（高危操作）。",
+                    "content": "我先跑一条只读复合命令 `ls -la && pwd`，再试一条夹带 `rm` 的复合命令 `ls -la && rm -f fib.py`。",
                     "tool_calls": [
-                        {"id": tc_read.id, "type": "function", "function": {"name": tc_read.name, "arguments": tc_read.arguments}},
-                        {"id": tc_rm.id, "type": "function", "function": {"name": tc_rm.name, "arguments": tc_rm.arguments}},
+                        {"id": tc_safe.id, "type": "function", "function": {"name": tc_safe.name, "arguments": tc_safe.arguments}},
+                        {"id": tc_sneaky.id, "type": "function", "function": {"name": tc_sneaky.name, "arguments": tc_sneaky.arguments}},
                     ],
                 },
             )
         if self.turn == 2:
+            code = (
+                "import os, tempfile\n"
+                "print('HOST OPENAI_API_KEY visible in child?:', bool(os.environ.get('OPENAI_API_KEY')))\n"
+                "print('Isolated TMPDIR:', tempfile.gettempdir())\n"
+            )
             tc_write = ToolCall(
                 id="call_2_write",
                 name="write_file",
-                arguments=json.dumps({"path": "hello_runtime.py", "content": "print('Hello from controlled AgentRuntime!')\n"}),
+                arguments=json.dumps({"path": "env_check.py", "content": code}),
             )
             return LLMResponse(
-                content="收到 `[PERMISSION_DENIED]`，用户拒绝删除 fib.py。我尊重用户决定，保留 fib.py，直接创建 `hello_runtime.py`。",
+                content="夹带 `rm` 的复合命令被 Permission Gate 拦截了 (`status=denied`)。我现在创建 `env_check.py` 来验证子进程环境变量隔离。",
                 tool_calls=[tc_write],
                 raw_message={
                     "role": "assistant",
-                    "content": "收到 `[PERMISSION_DENIED]`，用户拒绝删除 fib.py。我尊重用户决定，保留 fib.py，直接创建 `hello_runtime.py`。",
+                    "content": "夹带 `rm` 的复合命令被 Permission Gate 拦截了 (`status=denied`)。我现在创建 `env_check.py` 来验证子进程环境变量隔离。",
                     "tool_calls": [
                         {"id": tc_write.id, "type": "function", "function": {"name": tc_write.name, "arguments": tc_write.arguments}},
                     ],
                 },
             )
         if self.turn == 3:
-            tc_bash = ToolCall(
-                id="call_3_bash",
-                name="bash",
-                arguments='{"command": "python3 hello_runtime.py"}',
-            )
+            tc_run = ToolCall(id="call_3_run", name="bash", arguments='{"command": "python3 env_check.py"}')
             return LLMResponse(
-                content="文件已写入，现在在受控 Runtime 中运行 `python3 hello_runtime.py`。",
-                tool_calls=[tc_bash],
+                content="现在运行 `python3 env_check.py`（由于 `python3` 前缀已授信，自动放行）。",
+                tool_calls=[tc_run],
                 raw_message={
                     "role": "assistant",
-                    "content": "文件已写入，现在在受控 Runtime 中运行 `python3 hello_runtime.py`。",
+                    "content": "现在运行 `python3 env_check.py`（由于 `python3` 前缀已授信，自动放行）。",
                     "tool_calls": [
-                        {"id": tc_bash.id, "type": "function", "function": {"name": tc_bash.name, "arguments": tc_bash.arguments}},
+                        {"id": tc_run.id, "type": "function", "function": {"name": tc_run.name, "arguments": tc_run.arguments}},
                     ],
                 },
             )
 
-        out = next((m["content"] for m in messages if m.get("tool_call_id") == "call_3_bash"), "")
-        final_msg = f"`hello_runtime.py` 已在受控 Runtime 中创建并执行成功：\n{out}"
+        out = next((m["content"] for m in messages if m.get("tool_call_id") == "call_3_run"), "")
+        final_msg = f"验证完成！受控沙盒运行结果如下：\n{out}"
         return LLMResponse(
             content=final_msg,
             tool_calls=[],
@@ -172,20 +200,25 @@ class ScriptedRuntimeDemoLLM:
 
 
 def run_demo(workspace_dir: Path, registry: ToolRegistry) -> None:
+    # 模拟宿主机存在敏感 API Key，验证子进程无法偷取它
+    os.environ.setdefault("OPENAI_API_KEY", "sk-demo-host-secret-key")
+
     def demo_permission_policy(tool_name: str, args: dict[str, Any]) -> bool:
-        # 自动演示：如果是 rm 删除命令则拒绝，其他正常新建/运行命令则批准
         cmd = str(args.get("command", ""))
         if tool_name == "bash" and "rm " in cmd:
-            log_step("PERMISSION GATE", f"拦截高危删除命令: {tool_name}({args}) -> 自动决策: 拒绝 (DENY)", color="red")
+            log_step("PERMISSION GATE", f"发现高危子命令，拒绝执行: {cmd}", color="red")
             return False
-        log_step("PERMISSION GATE", f"审批高危操作: {tool_name}({args}) -> 自动决策: 允许 (ALLOW)", color="green")
+        log_step("PERMISSION GATE", f"批准操作: {tool_name}({args})", color="green")
         return True
 
     runtime = AgentRuntime(
         workspace_root=workspace_dir,
         permission_callback=demo_permission_policy,
     )
-    prompt = "查看 fib.py，并创建一个 hello_runtime.py 打印问候语后运行它"
+    # 模拟用户之前已经对 `python3` 前缀点过一次 "a (Always allow prefix)"
+    runtime.allow_command_prefix("python3")
+
+    prompt = "查看目录文件，测试权限拦截与子进程环境变量净室隔离"
     run_runtime_agent_loop(prompt, llm=ScriptedRuntimeDemoLLM(), registry=registry, runtime=runtime)
 
 
@@ -195,7 +228,7 @@ def main() -> None:
     args = sys.argv[1:]
 
     if "--demo" in args:
-        log_step("DEMO", "运行 Step 3 Runtime 与 Permission Gate 演示", color="green")
+        log_step("DEMO", "运行 Step 3 Runtime（命令拆解前缀引擎 + 沙盒环境隔离 + 结构化结果）演示", color="green")
         run_demo(workspace_dir, registry)
         return
 
@@ -205,7 +238,6 @@ def main() -> None:
         run_demo(workspace_dir, registry)
         return
 
-    # 真实 API 模式：使用默认的终端 [y/n/a] 交互式审批！
     runtime = AgentRuntime(workspace_root=workspace_dir)
     if args:
         run_runtime_agent_loop(" ".join(args), llm=client, registry=registry, runtime=runtime)
