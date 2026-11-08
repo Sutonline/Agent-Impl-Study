@@ -1,18 +1,12 @@
 from __future__ import annotations
 
 """
-Step 2 核心组件：Tool 抽象、自动 Schema 生成与四大编码工具 (harness/tool.py)
+Step 2 & Step 3 核心组件：Tool 抽象、自动 Schema 生成与四大编码工具 (harness/tool.py)
 
 第一性原理视角：
-在 Step 1 中，我们为了给 LLM 提供两个小工具，不得不：
-  1) 手写冗长的 JSON Schema 字典告诉 LLM 工具长什么样；
-  2) 手写 if/elif 解析 JSON 并调用 Python 函数。
-这违反了 DRY 原则——Python 函数本身的签名（函数名、参数名、类型注解、默认值、文档字符串）
-已经包含了生成 JSON Schema 所需的全部信息！
-
-因此，Tool 抽象层的本质就是一座“双向桥”：
-  - 向左（朝向 LLM）：用 `inspect.signature` 把 Python 函数反射成 OpenAI JSON Schema；
-  - 向右（朝向系统）：把 LLM 返回的 `tool_call(name, arguments_json)` 自动反序列化并路由到对应的 Python 函数。
+Tool 抽象层的本质是一座“双向桥”：
+  - 向左（朝向 LLM）：用 `inspect.signature` 把 Python 函数反射成 OpenAI JSON Schema（自动隐藏 `runtime` 参数）；
+  - 向右（朝向系统）：把 LLM 返回的 `tool_call(name, arguments_json)` 自动反序列化，并注入宿主 `runtime: AgentRuntime` 实例。
 """
 
 from dataclasses import dataclass
@@ -20,7 +14,10 @@ import inspect
 import json
 from pathlib import Path
 import subprocess
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from harness.runtime import AgentRuntime
 
 TYPE_MAP: dict[Any, str] = {
     str: "string",
@@ -62,7 +59,7 @@ def tool(
 ) -> Callable[[Callable[..., Any]], Tool]:
     """
     装饰器：将一个普通 Python 函数转换为 `Tool` 对象，并自动从类型注解生成 JSON Schema。
-    如果函数参数名为 `runtime`，它会被视为 Harness 内部注入的上下文参数，不暴露给 LLM。
+    如果函数参数名为 `runtime`（类型为 `AgentRuntime | None`），它会被视为 Harness 内部注入的环境容器，不暴露给 LLM。
     """
 
     def decorator(func: Callable[..., Any]) -> Tool:
@@ -124,8 +121,19 @@ class ToolRegistry:
     def openai_schemas(self) -> list[dict[str, Any]]:
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    def execute(self, name: str, raw_arguments: str, **context: Any) -> str:
-        """根据工具名和原始 JSON 字符串执行工具，始终返回字符串结果（不会因 JSON 错误直接崩掉循环）。"""
+    def execute(
+        self,
+        name: str,
+        raw_arguments: str,
+        runtime: AgentRuntime | None = None,
+        **context: Any,
+    ) -> str:
+        """
+        根据工具名和原始 JSON 字符串执行工具：
+        1. 解析 JSON 参数；
+        2. 若传入了 `runtime: AgentRuntime`，先执行 `runtime.check_permission(tool, args)` 权限门禁；
+        3. 若工具函数声明了 `runtime` 参数，将 `runtime` 实例注入调用。
+        """
         t = self.get(name)
         if t is None:
             return f"[ERROR] Unknown tool: '{name}'"
@@ -137,10 +145,8 @@ class ToolRegistry:
         except json.JSONDecodeError as e:
             return f"[ERROR] Invalid JSON arguments for tool '{name}': {e}"
 
-        runtime = context.get("runtime")
-
-        # Step 3 钩子预留：如果传入了 runtime，先经过 runtime 的权限门禁检查
-        if runtime is not None and hasattr(runtime, "check_permission"):
+        # Step 3: 如果提供了 AgentRuntime，执行 Permission Gate 拦截检查
+        if runtime is not None:
             allowed, deny_reason = runtime.check_permission(t, args)
             if not allowed:
                 return f"[PERMISSION_DENIED] {deny_reason}"
@@ -164,16 +170,16 @@ class ToolRegistry:
 def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
     """
     创建 Coding Agent 最核心的四个工具：
-    - read_file:  眼睛（查看代码）
-    - write_file: 双手（创建/覆写文件）
-    - edit_file:  手术刀（局部精确替换代码）
-    - bash:       执行器（跑测试、装依赖、看 git 状态）
+    - read_file:  眼睛（查看代码，dangerous=False）
+    - write_file: 双手（创建/覆写文件，dangerous=True）
+    - edit_file:  手术刀（局部精确替换代码，dangerous=True）
+    - bash:       执行器（受控子进程跑命令，dangerous=True）
     """
     default_root = (base_dir or (Path.cwd() / "workspace")).resolve()
     default_root.mkdir(parents=True, exist_ok=True)
 
-    def _resolve_target(path_str: str, runtime: Any = None) -> Path:
-        if runtime is not None and hasattr(runtime, "resolve_path"):
+    def _resolve_target(path_str: str, runtime: AgentRuntime | None = None) -> Path:
+        if runtime is not None:
             return runtime.resolve_path(path_str)
         p = Path(path_str)
         return p if p.is_absolute() else (default_root / p).resolve()
@@ -183,7 +189,7 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
         description="Read the text contents of a file at the given path.",
         dangerous=False,
     )
-    def read_file(path: str, runtime: Any = None) -> str:
+    def read_file(path: str, runtime: AgentRuntime | None = None) -> str:
         target = _resolve_target(path, runtime)
         if not target.exists():
             return f"[ERROR] File not found: {path}. Use bash('ls') to check existing files."
@@ -199,11 +205,11 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
         description="Create or overwrite a file with the provided full content.",
         dangerous=True,
     )
-    def write_file(path: str, content: str, runtime: Any = None) -> str:
+    def write_file(path: str, content: str, runtime: AgentRuntime | None = None) -> str:
         target = _resolve_target(path, runtime)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        if runtime is not None and hasattr(runtime, "modified_files"):
+        if runtime is not None:
             runtime.modified_files.add(target)
         return f"[OK] Wrote {len(content)} characters to {path}"
 
@@ -212,7 +218,7 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
         description="Replace an exact occurrence of old_text with new_text in a file.",
         dangerous=True,
     )
-    def edit_file(path: str, old_text: str, new_text: str, runtime: Any = None) -> str:
+    def edit_file(path: str, old_text: str, new_text: str, runtime: AgentRuntime | None = None) -> str:
         target = _resolve_target(path, runtime)
         if not target.exists():
             return f"[ERROR] File not found: {path}. Cannot edit a non-existent file."
@@ -230,7 +236,7 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
             )
         updated = content.replace(old_text, new_text, 1)
         target.write_text(updated, encoding="utf-8")
-        if runtime is not None and hasattr(runtime, "modified_files"):
+        if runtime is not None:
             runtime.modified_files.add(target)
         return f"[OK] Edited {path} successfully"
 
@@ -239,8 +245,8 @@ def create_coding_tools(base_dir: Path | None = None) -> ToolRegistry:
         description="Execute a shell command in the workspace directory and return stdout/stderr.",
         dangerous=True,
     )
-    def bash(command: str, runtime: Any = None) -> str:
-        if runtime is not None and hasattr(runtime, "run_command"):
+    def bash(command: str, runtime: AgentRuntime | None = None) -> str:
+        if runtime is not None:
             return runtime.run_command(command)
         proc = subprocess.run(
             command,
