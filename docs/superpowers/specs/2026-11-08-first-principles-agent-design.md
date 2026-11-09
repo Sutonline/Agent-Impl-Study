@@ -2,7 +2,7 @@
 
 - **日期**：2026-11-08
 - **项目路径**：`/opt/docs/study/agent-impl2`
-- **工作量规模**：完整教学型工程项目（分 8 个独立可运行演进步骤）
+- **工作量规模**：完整教学型工程项目（分 9 个独立可运行演进步骤）
 
 ---
 
@@ -12,7 +12,7 @@
 - **LLM（大脑）**：本质是一个无状态的 Token 预测器（输入消息列表，输出文本或结构化工具调用意图）。它自己既没有手脚，也没有记忆管理、错误恢复或安全边界。
 - **Harness（马具/工程骨架）**：包裹在 LLM 外层的控制循环、运行时环境、工具体系、校验机制、容错恢复、技能按需加载、上下文压缩与子智能体调度器。
 
-本项目的核心目的是**通过第一性原理（First Principles）从 0 到 1 亲手构建一个精简版 Claude Code**。为了达到最佳学习效果，项目不是一次性倾倒全部代码，而是拆解为 8 个递进步骤：每一步只针对前一步暴露的真实痛点引入一个核心 Harness 机制；**每完成一步必须暂停**，由学习者亲自阅读代码并运行体验后，再推进下一步。
+本项目的核心目的是**通过第一性原理（First Principles）从 0 到 1 亲手构建一个精简版 Claude Code**。为了达到最佳学习效果，项目不是一次性倾倒全部代码，而是拆解为 9 个递进步骤：每一步只针对前一步暴露的真实痛点引入一个核心 Harness 机制；**每完成一步必须暂停**，由学习者亲自阅读代码并运行体验后，再推进下一步。
 
 ---
 
@@ -86,7 +86,9 @@
 │   ├── context.py               # [Step 6] 环境感知（OS/cwd/git/AGENTS.md）与动态 System Prompt 组装
 │   ├── skills.py                # [Step 6] SKILL.md 元数据扫描与按需加载工具 (load_skill)
 │   ├── compaction.py            # [Step 7] 工具大输出截断与历史上下文自动摘要压缩 (Context Compaction)
-│   └── subagent.py              # [Step 8] 独立上下文的子智能体派生器 (task 工具)
+│   ├── subagent.py              # [Step 8] 独立上下文的子智能体派生器 (task 工具)
+│   ├── todo.py                  # [Step 9] Plan/Act 双模态状态机与 TodoWrite 生命周期守门员
+│   └── agent.py                 # 终极整合版 Agent 类
 └── steps/                       # 每一步独立可运行的入口与配套实验场景
     ├── step01_bare_loop.py      # Step 1: 最小 ReAct / Tool-Calling 循环
     ├── step02_tools.py          # Step 2: 标准 Tool 抽象与文件/Bash 四大基础工具
@@ -95,7 +97,8 @@
     ├── step05_recovery.py       # Step 5: 异常自愈 (Self-Correction)、死循环打断与 Session 恢复
     ├── step06_context_skills.py # Step 6: 环境锚定 (AGENTS.md) 与 Skills 渐进式披露
     ├── step07_compaction.py     # Step 7: 长对话上下文自动压缩与大输出折叠
-    └── step08_subagent_cli.py   # Step 8: Subagent 委派 + 终极版 Mini Claude Code CLI
+    ├── step08_subagent_cli.py   # Step 8: Subagent 委派 + 终极版 Mini Claude Code CLI
+    └── step09_plan_todo.py      # Step 9: Plan/Act 双模式与 TodoWrite 完结守门员演示
 ```
 
 ### 5.2 八步第一性原理演进明细
@@ -183,6 +186,16 @@
   - `harness/subagent.py`：实现 `task(description, prompt)` 工具。调用时，在同一个 `AgentRuntime` 下创建一个拥有**全新独立 `messages` 列表**的子 Agent 循环（默认仅开放只读/探索类工具或受限迭代次数），子 Agent 在后台跑完多轮探索后，只将最终总结报告作为 `task` 工具的返回值交还给主 Agent。
   - `steps/step08_subagent_cli.py`：将前 7 步所有模块完整串联，支持交互式命令（`/help`, `/compact`, `/skills`, `/session`, `/quit`），成为一个五脏俱全的精简版 Claude Code。
 - **可运行实验**：运行 `steps/step08_subagent_cli.py`，下达一个复合任务（先派子智能体调研工作区代码结构，主智能体再根据报告修改代码并通过校验）。
+
+#### Step 9：Plan & Todo 模式（Phase Separation & Todo Lifecycle Gatekeeper）
+- **第一性原理问题**：在复杂长链路任务中，LLM 容易“未做深入探索就盲目乱改代码”或者“半途而废、执行到一半遗忘剩余任务”。
+- **核心实现**：
+  - `harness/todo.py`：
+    1. **Plan/Act 双模态状态机**：挂载 `make_plan_mode_pre_tool_hook` 到 `pre_tool_use` 管道。在 `mode == "plan"` 阶段拦截一切破坏性修改操作（`write_file`, `edit_file`, 非只读 `bash`），强制 LLM 仅能使用只读探索与规划工具（`read_file`, `task`, `todo_write`），完成方案构思后调用 `exit_plan_mode` 切换至 `ACT` 模式。
+    2. **`todo_write` 任务看板与单一在办约束**：动态维护结构化待办列表，并施加硬性约束：**同一时刻最多只能有 1 个处于 `in_progress` 状态的 Todo 项**，强迫注意力线性聚焦。
+    3. **`pre_stop` 完结守门员**：挂载 `make_todo_pre_stop_hook`。当 LLM 停止调用工具准备交卷时，若当前仍在 `plan` 模式或仍有未标记为 `completed` 的 Todo 项，直接否决退出（veto stop），打回主循环强制补齐任务。
+  - `steps/step09_plan_todo.py`：提供完整的剧本式离线演示与真实 LLM 交互入口。
+- **可运行实验**：运行 `python3 steps/step09_plan_todo.py --demo`，观察 LLM 在 Plan 阶段被拦截、制定计划切换到 Act 阶段、试图提前交卷被 Todo 守门员拦截并最终全量完成的全流程。
 
 ---
 

@@ -167,6 +167,9 @@ def print_cli_help() -> None:
         "  /skills   列出当前已发现的 Skills\n"
         "  /compact  立即强制压缩当前对话上下文\n"
         "  /session  显示当前会话消息数与估算 Token 数\n"
+        "  /todos    显示当前 Todo 任务看板与执行模式 (Plan/Act)\n"
+        "  /plan     手动切换至只读 PLAN 规划模式 (禁止写操作)\n"
+        "  /act      手动切换至 ACT 执行模式 (解锁写操作)\n"
         "  /quit     退出程序\n"
     )
 
@@ -187,22 +190,29 @@ def main() -> None:
         run_demo(workspace_dir, skills_dir)
         return
 
+    plan_flag = "--plan" in args
+    filtered_args = [a for a in args if a != "--plan"]
+
     agent = Agent(
         workspace_root=workspace_dir,
         llm=client,
         skills_dir=skills_dir,
         session_id="step08_cli",
+        enable_plan_todo=True,
+        initial_mode="plan" if plan_flag else "act",
     )
 
-    if args:
-        agent.run_turn(" ".join(args))
+    if filtered_args:
+        agent.run_turn(" ".join(filtered_args))
         return
 
-    print(f"=== Mini Claude Code (Step 8) 已启动 | 工作区: {workspace_dir} ===")
+    mode_label = "PLAN" if plan_flag else "ACT"
+    print(f"=== Mini Claude Code (Step 8/9) 已启动 | 工作区: {workspace_dir} | 初始模式: {mode_label} ===")
     print_cli_help()
     while True:
         try:
-            user_in = input("\nMiniClaude > ").strip()
+            mode_indicator = f"[{agent.todo_manager.mode.upper()}] " if agent.todo_manager else ""
+            user_in = input(f"\nMiniClaude {mode_indicator}> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -224,6 +234,23 @@ def main() -> None:
         if user_in == "/session":
             est = estimate_tokens(agent.runtime.messages)
             print(f"  Session ID: {agent.session_id} | Messages: {len(agent.runtime.messages)} | Est. Tokens: ~{est}")
+            continue
+        if user_in == "/todos":
+            if agent.todo_manager:
+                print(f"\n当前模式: {agent.todo_manager.mode.upper()}")
+                print(agent.todo_manager.render())
+            else:
+                print("  Plan & Todo 模式未启用。")
+            continue
+        if user_in == "/plan":
+            if agent.todo_manager:
+                agent.todo_manager.mode = "plan"
+                print("  已切换为 PLAN 规划模式（只读保护已开启，修改文件将被拦截）。")
+            continue
+        if user_in == "/act":
+            if agent.todo_manager:
+                agent.todo_manager.mode = "act"
+                print("  已切换为 ACT 执行模式（所有工具已解锁）。")
             continue
 
         agent.run_turn(user_in)

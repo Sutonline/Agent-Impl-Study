@@ -658,16 +658,16 @@ def test_subagent_runs_in_isolated_context_and_returns_summary(tmp_path: Path):
     assert rt.messages == parent_messages_before
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_step08_subagent.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'harness.subagent'`
 
-- [ ] **Step 3: Implement `harness/subagent.py`, `harness/agent.py`, `steps/step08_subagent_cli.py`, and `README.md`**
+- [x] **Step 3: Implement `harness/subagent.py`, `harness/agent.py`, `steps/step08_subagent_cli.py`, and `README.md`**
 
 Implement `register_subagent_tool` spawning an isolated `Agent` with a fresh `messages` list and returning only its final answer. Assemble the full `Agent` class in `harness/agent.py` and the interactive CLI in `steps/step08_subagent_cli.py` (supporting `/help`, `/compact`, `/skills`, `/session`, `/quit`).
 
-- [ ] **Step 4: Run full test suite to verify all 8 steps pass**
+- [x] **Step 4: Run full test suite to verify all 8 steps pass**
 
 Run: `pytest -v`
 Expected: All tests in `tests/test_step01_*.py` through `tests/test_step08_*.py` PASS.
@@ -694,4 +694,10 @@ Expected: All tests in `tests/test_step01_*.py` through `tests/test_step08_*.py`
       - `make_plan_mode_pre_tool_hook(self) -> PreToolHook` (blocks write/edit/bash tools while `mode == "plan"`)
       - `make_todo_pre_stop_hook(self) -> PreStopHook` (vetoes stop while `has_incomplete()` is `True`)
       - `register_todo_tools(self, registry: ToolRegistry) -> None` (registers `todo_write` and `exit_plan_mode`)
+
+- [x] **Step 1: Write the failing tests in `tests/test_step09_plan_todo.py`**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement `harness/todo.py` and `steps/step09_plan_todo.py`**
+- [x] **Step 4: Run full test suite to verify all 9 steps pass**
+
 
