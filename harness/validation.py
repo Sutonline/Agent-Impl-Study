@@ -30,6 +30,7 @@ class ValidationResult:
     passed: bool
     reason: str = ""
     recovery_hint: str = ""
+    status: str = "error"
 
     def format_feedback(self, stage: str) -> str:
         msg = f"[VALIDATION_FAILED:{stage}] {self.reason}"
@@ -97,6 +98,8 @@ PY_TYPE_CHECK: dict[str, type | tuple[type, ...]] = {
     "integer": int,
     "number": (int, float),
     "boolean": bool,
+    "array": list,
+    "object": dict,
 }
 
 

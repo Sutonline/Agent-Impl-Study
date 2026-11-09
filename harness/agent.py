@@ -24,6 +24,7 @@ from harness.recovery import LoopDetector, SessionStore, call_with_retry, inspec
 from harness.runtime import AgentRuntime
 from harness.skills import SkillManager
 from harness.subagent import register_subagent_tool
+from harness.todo import AgentMode, TodoManager
 from harness.tool import ToolRegistry, create_coding_tools
 from harness.ui import log_step
 from harness.validation import ValidationPipeline, create_default_validation_pipeline
@@ -49,6 +50,8 @@ class Agent:
         pre_stop_command: str | None = None,
         max_context_tokens: int = 6000,
         max_turns: int = 12,
+        enable_plan_todo: bool = False,
+        initial_mode: AgentMode = "act",
     ) -> None:
         self.llm = llm or LLMClient()
         self.runtime = AgentRuntime(
@@ -69,9 +72,25 @@ class Agent:
 
         register_subagent_tool(self.registry, llm=self.llm, runtime=self.runtime)
 
+        self.todo_manager: TodoManager | None = None
+        if enable_plan_todo:
+            self.todo_manager = TodoManager(mode=initial_mode)
+            self.todo_manager.register_todo_tools(self.registry)
+            self.validation.add_pre_tool(self.todo_manager.make_plan_mode_pre_tool_hook())
+            self.validation.add_pre_stop(self.todo_manager.make_todo_pre_stop_hook())
+
     def _ensure_system_prompt(self) -> None:
         if not self.runtime.messages:
             sys_prompt = build_system_prompt(self.runtime, skill_manager=self.skill_manager)
+            if self.todo_manager is not None:
+                sys_prompt += (
+                    "\n\n## Plan & Todo Workflow Rules\n"
+                    f"- Current Mode: `{self.todo_manager.mode.upper()}`\n"
+                    "- When in `PLAN` mode, mutating tools (`write_file`, `edit_file`, non-readonly `bash`) are blocked. "
+                    "First inspect files with `read_file`, create a step-by-step checklist with `todo_write` "
+                    "(at most ONE item `in_progress` at a time), and call `exit_plan_mode(plan_summary=...)` to enter `ACT` mode.\n"
+                    "- Before stopping, every item in `todo_write` must be marked `completed`."
+                )
             self.runtime.messages.append({"role": "system", "content": sys_prompt})
 
     def run_turn(self, user_input: str | None = None) -> str:

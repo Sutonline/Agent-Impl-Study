@@ -187,8 +187,9 @@ class ToolRegistry:
         if validation is not None and runtime is not None:
             pre_res = validation.run_pre_tool(t, args, runtime)
             if not pre_res.passed:
+                err_status: ToolStatus = "denied" if getattr(pre_res, "status", "error") == "denied" else "error"
                 return ToolExecutionResult(
-                    status="error",
+                    status=err_status,
                     content=pre_res.format_feedback("pre_tool_use"),
                     tool_name=name,
                 )
