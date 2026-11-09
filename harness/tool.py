@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from harness.runtime import AgentRuntime
+    from harness.validation import ValidationPipeline
 
 TYPE_MAP: dict[Any, str] = {
     str: "string",
@@ -148,12 +149,16 @@ class ToolRegistry:
         name: str,
         raw_arguments: str,
         runtime: AgentRuntime | None = None,
+        validation: ValidationPipeline | None = None,
         **context: Any,
     ) -> ToolExecutionResult:
         """
         结构化执行入口（供 Harness Loop 使用）：
-        返回 `ToolExecutionResult(status="ok" | "error" | "denied", content=...)`，
-        让 Harness 无需靠字符串匹配即可精确识别执行结果状态。
+        1. 解析 JSON 参数；
+        2. [Step 4] 若提供了 `validation`，先执行 `validation.run_pre_tool(t, args, runtime)`；
+        3. [Step 3] 若提供了 `runtime`，执行 `runtime.check_permission(t, args)`；
+        4. 调用工具函数；
+        5. [Step 4] 若提供了 `validation`，执行 `validation.run_post_tool(t, args, raw_out, runtime)`。
         """
         t = self.get(name)
         if t is None:
@@ -178,6 +183,16 @@ class ToolRegistry:
                 tool_name=name,
             )
 
+        # Step 4: 执行前拦截钩子 (pre_tool_use Hooks) —— 不通过则短路返回，不弹窗、不落盘
+        if validation is not None and runtime is not None:
+            pre_res = validation.run_pre_tool(t, args, runtime)
+            if not pre_res.passed:
+                return ToolExecutionResult(
+                    status="error",
+                    content=pre_res.format_feedback("pre_tool_use"),
+                    tool_name=name,
+                )
+
         # Step 3: 如果提供了 AgentRuntime，执行 Permission Gate 拦截检查
         if runtime is not None:
             allowed, deny_reason = runtime.check_permission(t, args)
@@ -200,6 +215,16 @@ class ToolRegistry:
                 content=f"[ERROR] Tool '{name}' execution failed: {type(e).__name__}: {e}",
                 tool_name=name,
             )
+
+        # Step 4: 执行后校验钩子 (post_tool_use Hooks)
+        if validation is not None and runtime is not None:
+            post_res = validation.run_post_tool(t, args, raw_out, runtime)
+            if not post_res.passed:
+                return ToolExecutionResult(
+                    status="error",
+                    content=f"{raw_out}\n{post_res.format_feedback('post_tool_use')}",
+                    tool_name=name,
+                )
 
         is_err = raw_out.startswith("[ERROR]") or "[exit_code=" in raw_out and not raw_out.startswith("[exit_code=0]")
         return ToolExecutionResult(
