@@ -4,18 +4,15 @@ from __future__ import annotations
 Step 5 核心组件：Recovery 容错、死循环检测与会话断点恢复 (harness/recovery.py)
 
 设计机制：
-在真实运行环境中，Agent 会面临四个层面的故障，需要四类不同的恢复手段：
-1. **工具调用失败指导（Structured Error Observation）**：
-   不仅告诉 LLM “错了”，还要附上明确的 `RECOVERY_HINT`（例如 `edit_file` 匹配失败时要求先调 `read_file`）。
-2. **重复报错死循环检测（`LoopDetector`）**：
-   LLM 常见故障是对着同一个错误参数反复重试（如连续 3 次传一模一样的 `old_text` 调 `edit_file`）。
-   `LoopDetector` 对 `(tool_name, canonical_json_args)` 计算签名，一旦连续 `max_repeats` 次报相同的错，
-   立即返回 `[LOOP_DETECTED]` 强干预警告，打断模型的思维惯性。
-3. **LLM 接口退避重试（`call_with_retry`）**：
-   针对 HTTP 429 限流、网络抖动超时，使用指数退避（Exponential Backoff）重试，避免因偶发网络波动中断整个任务。
-4. **会话断点持久化与恢复（`SessionStore`）**：
-   每轮循环结束时通过原子写入（Write-to-temp + `os.replace`）将 `messages` 落盘到 `.sessions/<id>.json`。
-   进程被杀或崩溃后，可通过 `load(session_id)` 从断点精确续跑。
+1. **工具调用失败指导（Structured Error Observation）**
+2. **重复报错死循环检测（`LoopDetector`）**
+3. **LLM 接口退避重试（`call_with_retry`）**
+4. **会话断点持久化与尾部状态恢复机（`SessionStore` + `inspect_session_state`）**：
+   恢复会话时不能无脑重新追加初始 Prompt，必须检查 `messages` 尾部处于哪种状态：
+   - `"empty"`：空会话或仅有 system 消息；
+   - `"completed"`：最后一条是无 `tool_calls` 的 `assistant` 消息（上一轮任务已正常结束）；
+   - `"pending_llm"`：最后一条是 `user` 或已完成全部配对的 `tool` 消息（上次在调 `llm.chat` 前中断）；
+   - `"incomplete_tool_calls"`：存在 `assistant.tool_calls`，但缺少对应的 `role="tool"` 结果消息（上次在执行工具中途中断）。
 """
 
 from dataclasses import dataclass, field
@@ -23,11 +20,14 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 
+from harness.llm import ToolCall
 from harness.ui import log_step
 
 T = TypeVar("T")
+
+SessionState = Literal["empty", "completed", "pending_llm", "incomplete_tool_calls"]
 
 
 def format_error_observation(error_type: str, reason: str, recovery_hint: str = "") -> str:
@@ -110,6 +110,65 @@ def call_with_retry(
     raise last_exc
 
 
+def inspect_session_state(messages: list[dict[str, Any]]) -> tuple[SessionState, list[ToolCall]]:
+    """
+    检查会话消息列表的尾部状态，返回 `(SessionState, 未执行的 ToolCall 列表)`：
+    - `"empty"`：无消息或只有 `system` 消息；
+    - `"completed"`：最后一条是 `assistant` 且不含 `tool_calls`（任务已正常结束）；
+    - `"incomplete_tool_calls"`：最后一次 `assistant` 发出了 `tool_calls`，但后续缺少对应的 `role="tool"` 结果；
+    - `"pending_llm"`：最后一条是 `user` 消息，或所有 `tool_calls` 都已有对应的 `role="tool"` 结果，正等待调用 `llm.chat`。
+    """
+    non_sys = [m for m in messages if m.get("role") != "system"]
+    if not non_sys:
+        return "empty", []
+
+    last_msg = non_sys[-1]
+    role = last_msg.get("role")
+
+    if role == "user":
+        return "pending_llm", []
+
+    if role == "assistant":
+        raw_tcs = last_msg.get("tool_calls") or []
+        if not raw_tcs:
+            return "completed", []
+        missing = [
+            ToolCall(
+                id=tc["id"],
+                name=tc["function"]["name"],
+                arguments=tc["function"]["arguments"],
+            )
+            for tc in raw_tcs
+        ]
+        return "incomplete_tool_calls", missing
+
+    if role == "tool":
+        # 往回找到最近的一条带 tool_calls 的 assistant 消息，核对是否所有 tool_call_id 都已凑齐
+        completed_ids: set[str] = set()
+        for m in reversed(non_sys):
+            if m.get("role") == "tool":
+                tc_id = m.get("tool_call_id")
+                if tc_id:
+                    completed_ids.add(tc_id)
+            elif m.get("role") == "assistant":
+                raw_tcs = m.get("tool_calls") or []
+                missing = [
+                    ToolCall(
+                        id=tc["id"],
+                        name=tc["function"]["name"],
+                        arguments=tc["function"]["arguments"],
+                    )
+                    for tc in raw_tcs
+                    if tc["id"] not in completed_ids
+                ]
+                if missing:
+                    return "incomplete_tool_calls", missing
+                return "pending_llm", []
+        return "pending_llm", []
+
+    return "pending_llm", []
+
+
 class SessionStore:
     """
     会话断点持久化存储器：
@@ -130,8 +189,10 @@ class SessionStore:
     def save(self, session_id: str, messages: list[dict[str, Any]]) -> Path:
         target = self._session_path(session_id)
         tmp_path = target.with_suffix(".json.tmp")
+        state, _ = inspect_session_state(messages)
         payload = {
             "session_id": session_id,
+            "state": state,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "message_count": len(messages),
             "messages": messages,
