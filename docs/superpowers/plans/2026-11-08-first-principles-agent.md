@@ -671,3 +671,27 @@ Implement `register_subagent_tool` spawning an isolated `Agent` with a fresh `me
 
 Run: `pytest -v`
 Expected: All tests in `tests/test_step01_*.py` through `tests/test_step08_*.py` PASS.
+
+---
+
+### Task 9: Step 9 — Plan & Todo Mode (`todo.py` + `step09_plan_todo.py`)
+
+**Files:**
+- Create: `harness/todo.py`
+- Create: `steps/step09_plan_todo.py`
+- Test: `tests/test_step09_plan_todo.py`
+
+**Interfaces:**
+- Consumes: `harness.tool.ToolRegistry`, `harness.validation.ValidationPipeline`, `harness.runtime.AgentRuntime`
+- Produces:
+  - `harness.todo`:
+    - `@dataclass class TodoItem: id: str; content: str; status: Literal["pending", "in_progress", "completed"]`
+    - `class TodoManager:`
+      - `items: list[TodoItem]`
+      - `mode: Literal["plan", "act"]`
+      - `update(self, items: list[dict]) -> str`
+      - `has_incomplete(self) -> bool`
+      - `make_plan_mode_pre_tool_hook(self) -> PreToolHook` (blocks write/edit/bash tools while `mode == "plan"`)
+      - `make_todo_pre_stop_hook(self) -> PreStopHook` (vetoes stop while `has_incomplete()` is `True`)
+      - `register_todo_tools(self, registry: ToolRegistry) -> None` (registers `todo_write` and `exit_plan_mode`)
+
